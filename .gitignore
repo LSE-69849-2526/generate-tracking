@@ -1,0 +1,9 @@
+
+input_po/
+output_pi/
+output_tracking/
+data/pi_counter.txt
+.venv/
+__pycache__/
+.DS_Store
+~$*.xlsx
