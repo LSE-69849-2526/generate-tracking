@@ -1,7 +1,12 @@
 """Compatibility entrypoint for the existing Streamlit deployment URL."""
 
-from pathlib import Path
 import runpy
+import sys
+from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
 
-runpy.run_path(str(Path(__file__).resolve().parents[1] / "app.py"), run_name="__main__")
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+runpy.run_path(str(ROOT / "app.py"), run_name="__main__")
