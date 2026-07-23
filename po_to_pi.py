@@ -1,8 +1,12 @@
 import os
 import re
 import shutil
+import tempfile
+import zipfile
 from copy import copy
 from datetime import datetime
+from io import BytesIO
+from pathlib import Path
 import pdfplumber
 import pandas as pd
 from openpyxl import load_workbook
@@ -10,11 +14,12 @@ from openpyxl import load_workbook
 # ==========================================
 # 1. 配置文件路径与表格坐标
 # ==========================================
-TEMPLATE_PATH = "templates/PI_template.xlsx"
-SKU_TABLE_PATH = "data/internal_sku.xlsx"
+BASE_DIR = Path(__file__).resolve().parent
+TEMPLATE_PATH = BASE_DIR / "templates/PI_template.xlsx"
+SKU_TABLE_PATH = BASE_DIR / "data/internal_sku.xlsx"
 INPUT_DIR = "input_po"
 OUTPUT_DIR = "output_pi"
-COUNTER_FILE = "data/pi_counter.txt"
+COUNTER_FILE = BASE_DIR / "data/pi_counter.txt"
 
 CELL_PI_NO = "F8"      
 CELL_PO_NO = "F9"      
@@ -509,6 +514,88 @@ def insert_product_rows(ws, first_insert_row, row_count):
 # ==========================================
 # 5. 写入 Excel (全范围雷达防撞机制)
 # ==========================================
+def build_pi_workbook(po_data, pi_number):
+    """Create a PI workbook from already-parsed PO data."""
+    wb = load_workbook(TEMPLATE_PATH)
+    ws = wb.active
+
+    ws[CELL_PI_NO] = pi_number
+    ws[CELL_PO_NO] = po_data["po_number"]
+    ws[CELL_INVOICE_DATE] = datetime.now().strftime("%Y-%m-%d")
+    ws[CELL_BILL_TO] = po_data["bill_to"]
+    ws[CELL_SHIP_TO] = po_data["deliver_to"]
+
+    products = po_data["products"]
+    insert_product_rows(ws, START_ROW_PRODUCTS + 2, max(0, len(products) - 2))
+
+    review_items = []
+    current_row = START_ROW_PRODUCTS
+    for item_index, prod in enumerate(products, start=1):
+        sku, eng_name, price = map_product_from_single_table(prod)
+        qty = prod["qty"]
+        if sku == "需核对" or eng_name == "需核对":
+            review_items.append(prod["raw_name"])
+
+        ws[f"{COL_ITEM}{current_row}"] = item_index
+        ws[f"{COL_SKU}{current_row}"] = sku
+        ws[f"{COL_PROD}{current_row}"] = eng_name
+        ws[f"{COL_QTY}{current_row}"] = qty
+        ws[f"{COL_PRICE}{current_row}"] = price
+        ws[f"{COL_AMOUNT}{current_row}"] = qty * price
+        current_row += 1
+
+    refresh_total_row(ws, START_ROW_PRODUCTS, current_row - 1, current_row)
+    return wb, review_items
+
+def create_pi_output(pdf_path, output_root):
+    """Create one delivery folder containing the original PO and its PI."""
+    po_data = extract_po_info(pdf_path)
+    pi_number, count = generate_pi_no()
+    order_folder = Path(output_root) / f"{count:02d}"
+    order_folder.mkdir(parents=True, exist_ok=True)
+
+    workbook, review_items = build_pi_workbook(po_data, pi_number)
+    filename = f"Libernovo-Relax The Back invoice-{pi_number} PO{po_data['po_number']}.xlsx"
+    output_path = order_folder / filename
+    workbook.save(output_path)
+    shutil.copy2(pdf_path, order_folder / Path(pdf_path).name)
+    return {
+        "po_number": po_data["po_number"],
+        "pi_number": pi_number,
+        "folder": order_folder,
+        "pi_path": output_path,
+        "review_items": review_items,
+    }
+
+def convert_uploaded_pdfs(uploaded_files):
+    """Convert Streamlit UploadedFile objects and return a ZIP plus results."""
+    results = []
+    with tempfile.TemporaryDirectory(prefix="po_to_pi_") as temp_dir:
+        temp_root = Path(temp_dir)
+        output_root = temp_root / "pi_output"
+        output_root.mkdir()
+
+        for index, uploaded_file in enumerate(uploaded_files, start=1):
+            source_name = Path(uploaded_file.name).name
+            upload_dir = temp_root / f"upload_{index:03d}"
+            upload_dir.mkdir()
+            source_path = upload_dir / source_name
+            source_path.write_bytes(uploaded_file.getvalue())
+            try:
+                result = create_pi_output(source_path, output_root)
+                result["source_name"] = source_name
+                result["status"] = "success"
+                results.append(result)
+            except Exception as exc:
+                results.append({"source_name": source_name, "status": "error", "error": str(exc)})
+
+        archive = BytesIO()
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for file_path in output_root.rglob("*"):
+                if file_path.is_file():
+                    zip_file.write(file_path, file_path.relative_to(output_root))
+    return archive.getvalue(), results
+
 def process_po_to_pi():
     for folder in [INPUT_DIR, OUTPUT_DIR, "data", "templates"]:
         os.makedirs(folder, exist_ok=True)
@@ -520,52 +607,8 @@ def process_po_to_pi():
         
     for pdf_file in pdf_files:
         pdf_full_path = os.path.join(INPUT_DIR, pdf_file)
-        po_data = extract_po_info(pdf_full_path)
-        
-        new_pi_no, count = generate_pi_no()
-        folder_name = f"{count:02d}"
-        order_folder = os.path.join(OUTPUT_DIR, folder_name)
-        os.makedirs(order_folder, exist_ok=True)
-        
-        wb = load_workbook(TEMPLATE_PATH)
-        ws = wb.active
-        
-        ws[CELL_PI_NO] = new_pi_no
-        ws[CELL_PO_NO] = po_data["po_number"]
-        ws[CELL_INVOICE_DATE] = datetime.now().strftime("%Y-%m-%d") 
-        ws[CELL_BILL_TO] = po_data["bill_to"]
-        ws[CELL_SHIP_TO] = po_data["deliver_to"]
-
-        products = po_data["products"]
-        # The template contains two styled detail rows (15 and 16). Reserve
-        # all additional rows at once so merged payment cells move together.
-        insert_product_rows(ws, START_ROW_PRODUCTS + 2, max(0, len(products) - 2))
-
-        current_row = START_ROW_PRODUCTS
-        for item_index, prod in enumerate(products, start=1):
-            sku, eng_name, price = map_product_from_single_table(prod)
-            qty = prod["qty"]
-            amount = qty * price
-
-            ws[f"{COL_ITEM}{current_row}"] = item_index
-            ws[f"{COL_SKU}{current_row}"] = sku
-            ws[f"{COL_PROD}{current_row}"] = eng_name
-            ws[f"{COL_QTY}{current_row}"] = qty
-            ws[f"{COL_PRICE}{current_row}"] = price
-            ws[f"{COL_AMOUNT}{current_row}"] = amount
-            
-            current_row += 1
-
-        total_row = current_row
-        refresh_total_row(ws, START_ROW_PRODUCTS, current_row - 1, total_row)
-            
-        output_excel_name = f"Libernovo-Relax The Back invoice-{new_pi_no} PO{po_data['po_number']}.xlsx"
-        output_excel_path = os.path.join(order_folder, output_excel_name)
-        wb.save(output_excel_path)
-        
-        shutil.copy(pdf_full_path, os.path.join(order_folder, pdf_file))
-        
-        print(f"✅ 成功生成 PI，已存放至文件夹 -> [output_pi/{folder_name}]")
+        result = create_pi_output(pdf_full_path, OUTPUT_DIR)
+        print(f"✅ 成功生成 PI，已存放至文件夹 -> [{result['folder']}]")
 
 if __name__ == "__main__":
     process_po_to_pi()
